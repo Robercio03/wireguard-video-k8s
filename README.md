@@ -82,8 +82,7 @@ helm ...
 │   ├── rbac.yaml
 │   ├── video-configmap.yaml
 │   └── video-player-svc.yaml
-├── generate-wireguard-keys.sh
-└── README.md
+└── generate-wireguard-keys.sh
 ```
 
 ## 1. Clonar el repositorio
