@@ -1,0 +1,259 @@
+{{- range .Values.nodes }}
+{{- $node := . }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wireguard-{{ $node.name }}
+  namespace: {{ $.Values.namespace }}
+  labels:
+    {{- include "wireguard.labels" $ | nindent 4 }}
+    wireguard.node: {{ $node.name }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "wireguard.selectorLabels" $ | nindent 6 }}
+      wireguard.node: {{ $node.name }}
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        {{- include "wireguard.selectorLabels" $ | nindent 8 }}
+        wireguard.node: {{ $node.name }}
+      annotations:
+        checksum/peers: {{ include (print $.Template.BasePath "/configmap.yaml") $ | sha256sum }}
+        {{- if $.Values.video.enabled }}
+        checksum/video-scripts: {{ include (print $.Template.BasePath "/video-configmap.yaml") $ | sha256sum }}
+        {{- end }}  
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: {{ $node.hostname }}
+
+      hostNetwork: false
+      serviceAccountName: {{ include "wireguard.serviceAccountName" $ }}
+      tolerations:
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "node-role.kubernetes.io/master"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "node.kubernetes.io/not-ready"
+          operator: "Exists"
+          effect: "NoSchedule"
+
+      initContainers:
+        - name: generate-config
+          image: {{ $.Values.initImage.repository }}:{{ $.Values.initImage.tag }}
+          command:
+            - sh
+            - -c 
+            - |
+              apk add --no-cache curl ca-certificates jq
+              sh /peers/init.sh
+          env:
+            - name: MY_NODE_NAME
+              value: {{ $node.name | quote }}
+            - name: MY_WG_IP
+              value: {{ $node.wgIP | quote }}
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: MY_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          volumeMounts:
+            - name: peers-config
+              mountPath: /peers
+              readOnly: true
+            - name: wg-secret
+              mountPath: /secrets
+              readOnly: true
+            - name: config-rendered
+              mountPath: /config
+
+      containers:
+        - name: wireguard
+          image: {{ $.Values.image.repository }}:{{ $.Values.image.tag }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+
+          securityContext:
+            capabilities:
+              add:
+                - NET_ADMIN
+                - SYS_MODULE
+            privileged: false
+
+          env:
+            - name: PUID
+              value: "1000"
+            - name: PGID
+              value: "1000"
+            - name: WG_CONF_DIR
+              value: "/config/wg_confs"
+
+          ports:
+            - name: wireguard
+              containerPort: {{ $.Values.wireguard.port }}
+              protocol: UDP
+
+          volumeMounts:
+            - name: config-rendered
+              mountPath: /config/wg_confs
+              
+            - name: lib-modules
+              mountPath: /lib/modules
+              readOnly: true
+
+          resources:
+            {{- toYaml $.Values.workload.resources | nindent 12 }}
+
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "wg show {{ $.Values.wireguard.interface }} | grep -q 'interface'"
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            failureThreshold: 3
+
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "wg show {{ $.Values.wireguard.interface }} | grep -q 'interface'"
+            initialDelaySeconds: 15
+            periodSeconds: 15
+
+        {{- if and $.Values.video.enabled $.Values.video.sender.enabled (eq $node.name $.Values.video.sender.nodeName) }}
+        - name: video-sender
+          image: {{ $.Values.video.image.repository }}:{{ $.Values.video.image.tag }}
+          imagePullPolicy: {{ $.Values.video.image.pullPolicy }}
+          env:
+            - name: SENDER_CONTROL_PORT
+              value: {{ $.Values.video.sender.controlPort | quote }}
+            - name: SENDER_SCRIPT
+              value: "/scripts/sender-run.sh"
+          
+          command:
+            - /bin/sh
+            - -c
+            - |
+              /scripts/sender.sh
+
+          ports:
+            - name: video-control
+              containerPort: {{ $.Values.video.sender.controlPort }}
+              protocol: TCP          
+
+          volumeMounts:
+            - name: video-scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: video-results
+              mountPath: /results
+        {{- end }}
+
+        {{- if and $.Values.video.enabled $.Values.video.receiver.enabled (eq $node.name $.Values.video.receiver.nodeName) }}
+        - name: video-receiver
+          image: {{ $.Values.video.image.repository }}:{{ $.Values.video.image.tag }}
+          imagePullPolicy: {{ $.Values.video.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              /scripts/receiver.sh
+          ports:
+            - name: video-udp
+              containerPort: {{ $.Values.video.receiver.listenPort }}
+              protocol: UDP
+          volumeMounts:
+            - name: video-scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: video-results
+              mountPath: /results
+            - name: hls-output
+              mountPath: /hls
+
+        - name: video-player
+          image: nginx:alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http-hls
+              containerPort: 80
+              protocol: TCP
+          volumeMounts:
+            - name: hls-output
+              mountPath: /usr/share/nginx/html
+
+
+        {{- end }}
+
+      volumes:
+        - name: peers-config
+          configMap:
+            name: wireguard-peers
+            defaultMode: 0755   
+
+        - name: wg-secret
+          secret:
+            secretName: {{ $node.secretName }}
+            items:
+              - key: privateKey
+                path: privateKey
+            defaultMode: 0400
+
+        - name: config-rendered
+          emptyDir:
+            medium: Memory
+
+        - name: lib-modules
+          hostPath:
+            path: /lib/modules
+            type: Directory
+        
+        {{- if $.Values.video.enabled }}
+        - name: video-scripts
+          configMap:
+            name: wireguard-video-scripts
+            defaultMode: 0755
+        {{- end }}
+
+        {{- if $.Values.video.enabled }}
+        - name: video-results
+          emptyDir: {}
+        {{- end }}
+
+        {{- if and $.Values.video.enabled $.Values.video.receiver.enabled (eq $node.name $.Values.video.receiver.nodeName) }}
+        - name: hls-output
+          emptyDir: {}
+        {{- end }}
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: wireguard-{{ $node.name }}
+  namespace: {{ $.Values.namespace }}
+  labels:
+    {{- include "wireguard.labels" $ | nindent 4 }}
+    wireguard.node: {{ $node.name }}
+spec:
+  selector:
+    {{- include "wireguard.selectorLabels" $ | nindent 4 }}
+    wireguard.node: {{ $node.name }}
+  ports:
+    - name: wireguard
+      port: {{ $.Values.wireguard.port }}
+      targetPort: {{ $.Values.wireguard.port }}
+      protocol: UDP
+  type: {{ $.Values.service.type }}
+{{- end }}

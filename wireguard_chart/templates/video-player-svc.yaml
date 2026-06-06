@@ -1,0 +1,22 @@
+{{- if and .Values.video.enabled .Values.video.receiver.enabled .Values.video.hls.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: wireguard-video-player
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "wireguard.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.video.hls.service.type }}
+  selector:
+    {{- include "wireguard.selectorLabels" . | nindent 4 }}
+    wireguard.node: {{ .Values.video.receiver.nodeName }}
+  ports:
+    - name: http-hls
+      port: {{ .Values.video.hls.port }}
+      targetPort: 80
+      protocol: TCP
+      {{- if eq .Values.video.hls.service.type "NodePort" }}  
+      nodePort: {{ .Values.video.hls.service.nodePort }}
+      {{- end }}
+{{- end }}

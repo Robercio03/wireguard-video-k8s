@@ -1,0 +1,24 @@
+apiVersion: v2
+name: wireguard-video-k8s
+description: >
+  Helm Chart para desplegar una comunicación segura entre nodos de un cluster Kubernetes usando WireGuard, con una transmisión de vídeo que se realiza a través de la red.
+type: application
+
+version: 2.0.0
+appVersion: "1.0.0"
+
+keywords:
+  - wireguard
+  - vpn
+  - kubernetes
+  - helm
+  - networking
+  - video-streaming
+  - hls
+
+home: https://github.com/Robercio03/wireguard-video-k8s
+sources:
+  - https://github.com/Robercio03/wireguard-video-k8s
+
+maintainers:
+  - name: Roberto Ruiz García

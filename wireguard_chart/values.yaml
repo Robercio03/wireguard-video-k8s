@@ -1,0 +1,136 @@
+# ==============================================================================
+# Ajustes globales
+# ==============================================================================
+
+namespace: wireguard
+
+image:
+  repository: linuxserver/wireguard
+  tag: "1.0.20210914"       
+  pullPolicy: IfNotPresent
+
+initImage:
+  repository: alpine
+  tag: "3.19"
+
+workload:
+  resources: {}
+
+# ==============================================================================
+# Configuración de WireGuard 
+# ==============================================================================
+
+wireguard:
+  interface: wg0
+  port: 51820
+  networkCIDR: "10.200.0.0/24"
+
+# ==============================================================================
+# Definición de los nodos
+#
+#  name: identificador lógico usado por el chart
+#  hostname: nombre real del nodo en Kubernetes
+#  wgIP: IP privada asignada dentro de la red WireGuard
+#  secretName: nombre del secret con la clave privada del nodo
+# ==============================================================================
+
+nodes:
+  - name: k8s-wireguard--1
+    hostname: "k8s-wireguard--1"         
+    wgIP: "10.200.0.1"
+    secretName: "wg-key-control-plane"
+
+  - name: k8s-wireguard--2
+    hostname: "k8s-wireguard--2"
+    wgIP: "10.200.0.2"
+    secretName: "wg-key-worker-1"
+
+  - name: k8s-wireguard--3
+    hostname: "k8s-wireguard--3"
+    wgIP: "10.200.0.3"
+    secretName: "wg-key-worker-2"
+
+# ==============================================================================
+# Claves públicas de cada nodo, usadas para configurar los peers en WireGuard.
+# ==============================================================================
+
+publicKeys:
+  k8s-wireguard--1:            "V+bYjtyn+uB1BYMyqtG638clibr+PPe3c2bc3YUeShU="
+  k8s-wireguard--2:            "cOVqWO+vYjwYMTzzck4FHocq948tvR0xzSdTXIsnZRg="
+  k8s-wireguard--3:            "2FcjipB8E2UraMD8Pm7oJxfpQT4OOsWKD6bfXqqWKns="
+
+# ==============================================================================
+# Servicio Kubernetes usado por WireGuard para peer discovery y comunicación entre nodos.
+# ==============================================================================
+service:
+  type: ClusterIP
+  port: 51820
+  protocol: UDP
+
+# ==============================================================================
+# RBAC
+# ==============================================================================
+
+rbac:
+  create: true
+  serviceAccountName: wireguard-sa
+
+# ==============================================================================
+# Configuración de la transmisión de vídeo
+# ==============================================================================
+
+video:
+  enabled: true
+
+  image:
+    repository: localhost:32000/video-tools
+    tag: "0.4"
+    pullPolicy: IfNotPresent
+
+  test:
+    profileName: "4K30_25M"
+    durationSeconds: 12
+    sampleIntervalSeconds: 2
+
+  source:
+    inputFile: "/media/video_tfg.mp4"
+
+  sender:
+    enabled: true
+    nodeName: "k8s-wireguard--1"
+
+    destinationWGIP: "10.200.0.3"
+    destinationPort: 5004
+
+    width: 3840
+    height: 2160
+    fps: 30
+    bitrate: "25M"
+    pktSize: "1316"
+    socketBuffer: "425984"
+    
+    controlPort: 9090
+
+  receiver:
+    enabled: true
+    nodeName: "k8s-wireguard--3"
+    
+    listenPort: 5004
+    
+    fifoSize: "262144"
+    socketBuffer: "425984"
+    
+    senderControlURL: "http://10.200.0.1:9090/start"
+    maxWaitSeconds: 3600
+
+  hls:
+    enabled: true
+    port: 8080
+    segmentTime: 2
+    listSize: 0
+    service:
+      type: NodePort
+      nodePort: 30080
+    
+  mode: "udp-mpegts"
+

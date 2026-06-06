@@ -1,0 +1,431 @@
+{{- if .Values.video.enabled -}}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wireguard-video-scripts
+  namespace: {{ .Values.namespace }}
+  labels:
+{{- include "wireguard.labels" . | nindent 4 }}
+data:
+    sender.sh: |
+        #!/bin/sh
+        set -eu
+
+        echo "[video-sender] Arrancando servidor de control del emisor..."
+        python3 /scripts/sender-control.py
+
+    sender-control.py: |
+        #!/usr/bin/env python3
+
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import subprocess
+        import threading
+        import json
+        import time
+        import os
+
+        CONTROL_PORT = int(os.environ.get("SENDER_CONTROL_PORT", "{{ .Values.video.sender.controlPort }}"))
+        SENDER_SCRIPT = os.environ.get("SENDER_SCRIPT", "/scripts/sender-run.sh")
+
+        state = {
+            "started": False,
+            "running": False,
+            "exit_code": None,
+            "started_at": None,
+            "finished_at": None
+        }
+
+        lock = threading.Lock()
+
+        def run_sender():
+            with lock:
+                state["running"] = True
+                state["started_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                state["finished_at"] = None
+                state["exit_code"] = None
+
+            process = subprocess.run([SENDER_SCRIPT])
+
+            with lock:
+                state["running"] = False
+                state["exit_code"] = process.returncode
+                state["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        class Handler(BaseHTTPRequestHandler):
+            def send_json(self, code, payload):
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if self.path == "/health":
+                    self.send_json(200, {"status": "ok"})
+                    return
+
+                if self.path == "/status":
+                    with lock:
+                        payload = dict(state)
+                    self.send_json(200, payload)
+                    return
+
+                if self.path == "/start":
+                    with lock:
+                        if state["started"] or state["running"]:
+                            self.send_json(409, {
+                                "status": "already_started",
+                                "state": dict(state)
+                            })
+                            return
+
+                        state["started"] = True
+
+                    thread = threading.Thread(target=run_sender, daemon=True)
+                    thread.start()
+
+                    self.send_json(202, {
+                        "status": "started",
+                        "message": "Video transmission started"
+                    })
+                    return
+
+                self.send_json(404, {"error": "not_found"})
+
+            def log_message(self, format, *args):
+                print("[%s] %s" % (self.log_date_time_string(), format % args))
+
+        if __name__ == "__main__":
+            server = HTTPServer(("0.0.0.0", CONTROL_PORT), Handler)
+            print(f"[video-sender] Servidor de control escuchando en puerto {CONTROL_PORT}")
+            server.serve_forever()
+
+    sender-run.sh: |
+        #!/bin/sh
+        set -eu
+
+        PROFILE="{{ .Values.video.test.profileName }}"
+        DURATION="{{ .Values.video.test.durationSeconds }}"
+        SAMPLE_INTERVAL="{{ .Values.video.test.sampleIntervalSeconds }}"
+
+        INPUT_FILE="{{ .Values.video.source.inputFile }}"
+
+        DEST_IP="{{ .Values.video.sender.destinationWGIP }}"
+        DEST_PORT="{{ .Values.video.sender.destinationPort }}"
+        WIDTH="{{ .Values.video.sender.width }}"
+        HEIGHT="{{ .Values.video.sender.height }}"
+        FPS="{{ .Values.video.sender.fps }}"
+        BITRATE="{{ .Values.video.sender.bitrate }}"
+        PKT_SIZE="{{ .Values.video.sender.pktSize }}"
+        SENDER_BUFFER="{{ .Values.video.sender.socketBuffer }}"
+
+        RESULTS_DIR="/results"
+        mkdir -p "${RESULTS_DIR}"
+
+        echo "[video-sender] Perfil: ${PROFILE}" | tee "${RESULTS_DIR}/sender-summary.log"
+        echo "[video-sender] Fichero de entrada: ${INPUT_FILE}" | tee -a "${RESULTS_DIR}/sender-summary.log"
+        echo "[video-sender] Duración: ${DURATION}s" | tee -a "${RESULTS_DIR}/sender-summary.log"
+        echo "[video-sender] Destino: ${DEST_IP}:${DEST_PORT}" | tee -a "${RESULTS_DIR}/sender-summary.log"
+        echo "[video-sender] Resolución salida: ${WIDTH}x${HEIGHT}" | tee -a "${RESULTS_DIR}/sender-summary.log"
+        echo "[video-sender] FPS salida: ${FPS}" | tee -a "${RESULTS_DIR}/sender-summary.log"
+        echo "[video-sender] Bitrate salida: ${BITRATE}" | tee -a "${RESULTS_DIR}/sender-summary.log"
+        echo "[video-sender] pkt_size: ${PKT_SIZE}" | tee -a "${RESULTS_DIR}/sender-summary.log"
+        echo "[video-sender] socket buffer: ${SENDER_BUFFER}" | tee -a "${RESULTS_DIR}/sender-summary.log"
+
+        if [ ! -f "${INPUT_FILE}" ]; then
+            echo "[video-sender] ERROR: no existe el fichero ${INPUT_FILE}" | tee -a "${RESULTS_DIR}/sender-summary.log"
+            exit 1
+        fi
+
+        echo "[video-sender] Información del vídeo de entrada:" | tee "${RESULTS_DIR}/sender-input-info.log"
+        ffprobe -hide_banner "${INPUT_FILE}" >> "${RESULTS_DIR}/sender-input-info.log" 2>&1 || true
+
+        echo "[video-sender] Esperando a que wg0 esté listo..."
+        until ip link show wg0 > /dev/null 2>&1; do
+            sleep 1
+        done
+
+        echo "[video-sender] Interfaz wg0 detectada" | tee -a "${RESULTS_DIR}/sender-summary.log"
+        ip addr show wg0 > "${RESULTS_DIR}/sender-ip-addr.log" 2>&1 || true
+
+        SENDER_URL="udp://${DEST_IP}:${DEST_PORT}?pkt_size=${PKT_SIZE}&buffer_size=${SENDER_BUFFER}"
+        echo "[video-sender] URL de envío: ${SENDER_URL}" | tee -a "${RESULTS_DIR}/sender-summary.log"
+
+        echo "sample,elapsed_s,rx_bytes,tx_bytes,rx_packets,tx_packets" > "${RESULTS_DIR}/sender-wg0-samples.csv"
+
+        touch /tmp/ffmpeg-running
+
+        (
+            SAMPLE=0
+            START_TS=$(date +%s)
+
+            while [ -f /tmp/ffmpeg-running ]; do
+                NOW_TS=$(date +%s)
+                ELAPSED=$((NOW_TS - START_TS))
+
+                RX_BYTES=$(cat /sys/class/net/wg0/statistics/rx_bytes 2>/dev/null || echo 0)
+                TX_BYTES=$(cat /sys/class/net/wg0/statistics/tx_bytes 2>/dev/null || echo 0)
+                RX_PACKETS=$(cat /sys/class/net/wg0/statistics/rx_packets 2>/dev/null || echo 0)
+                TX_PACKETS=$(cat /sys/class/net/wg0/statistics/tx_packets 2>/dev/null || echo 0)
+
+                echo "${SAMPLE},${ELAPSED},${RX_BYTES},${TX_BYTES},${RX_PACKETS},${TX_PACKETS}" >> "${RESULTS_DIR}/sender-wg0-samples.csv"
+
+                SAMPLE=$((SAMPLE + 1))
+                sleep "${SAMPLE_INTERVAL}"
+            done
+        ) &
+
+        MONITOR_PID=$!
+
+        echo "[video-sender] Petición recibida. Iniciando transmisión de vídeo real a ${DEST_IP}:${DEST_PORT}" | tee -a "${RESULTS_DIR}/sender-summary.log"
+
+        ffmpeg -hide_banner -nostdin -nostats -loglevel warning -re \
+            -i "${INPUT_FILE}" \
+            -t "${DURATION}" \
+            -map 0:v:0 \
+            -map 0:a:0? \
+            -vf "scale=${WIDTH}:${HEIGHT},fps=${FPS},format=yuv420p" \
+            -c:v libx264 \
+            -preset ultrafast \
+            -tune zerolatency \
+            -b:v "${BITRATE}" \
+            -maxrate "${BITRATE}" \
+            -bufsize 4M \
+            -g "${FPS}" \
+            -x264-params "keyint=${FPS}:min-keyint=${FPS}:scenecut=0" \
+            -c:a aac \
+            -b:a 128k \
+            -ar 48000 \
+            -ac 2 \
+            -f mpegts \
+            -stats_period "${SAMPLE_INTERVAL}" \
+            -progress pipe:1 \
+            "${SENDER_URL}" \
+            2> "${RESULTS_DIR}/sender-ffmpeg-errors.log" \
+            | awk -F= '
+                BEGIN {
+                    print "sample,frame,fps,bitrate,total_size,out_time,speed,progress";
+                    sample=0;
+                }
+                {
+                    data[$1]=$2;
+                }
+                $1=="progress" {
+                    print sample "," data["frame"] "," data["fps"] "," data["bitrate"] "," data["total_size"] "," data["out_time"] "," data["speed"] "," data["progress"];
+                    fflush();
+                    sample++;
+                    delete data;
+                }
+            ' > "${RESULTS_DIR}/sender-progress.csv"
+
+        rm -f /tmp/ffmpeg-running
+        wait "${MONITOR_PID}" 2>/dev/null || true
+
+        echo "completed_at=$(date -Iseconds)" >> "${RESULTS_DIR}/sender-summary.log"
+        echo "[video-sender] Transmisión finalizada" | tee -a "${RESULTS_DIR}/sender-summary.log"
+
+    receiver.sh: |
+        #!/bin/sh
+        set -eu
+
+        PROFILE="{{ .Values.video.test.profileName }}"
+        DURATION="{{ .Values.video.test.durationSeconds }}"
+        SAMPLE_INTERVAL="{{ .Values.video.test.sampleIntervalSeconds }}"
+        LISTEN_PORT="{{ .Values.video.receiver.listenPort }}"
+
+        SENDER_CONTROL_URL="{{ .Values.video.receiver.senderControlURL }}"
+
+        MAX_WAIT_SECONDS="{{ .Values.video.receiver.maxWaitSeconds }}"
+
+        FIFO_SIZE="{{ .Values.video.receiver.fifoSize }}"
+        RECEIVER_BUFFER="{{ .Values.video.receiver.socketBuffer }}"
+
+        HLS_ENABLED="{{ .Values.video.hls.enabled }}"
+        HLS_DIR="/hls"
+        HLS_SEGMENT_TIME="{{ .Values.video.hls.segmentTime }}"
+        HLS_LIST_SIZE="{{ .Values.video.hls.listSize }}"
+
+        RESULTS_DIR="/results"
+        mkdir -p "${RESULTS_DIR}"
+        mkdir -p "${HLS_DIR}"
+
+        rm -f "${HLS_DIR}"/* || true
+
+        echo "[video-receiver] Perfil: ${PROFILE}" | tee "${RESULTS_DIR}/receiver-summary.log"
+        echo "[video-receiver] Puerto UDP: ${LISTEN_PORT}" | tee -a "${RESULTS_DIR}/receiver-summary.log"
+        echo "[video-receiver] HLS habilitado: ${HLS_ENABLED}" | tee -a "${RESULTS_DIR}/receiver-summary.log"
+        echo "[video-receiver] Directorio HLS: ${HLS_DIR}" | tee -a "${RESULTS_DIR}/receiver-summary.log"
+        echo "[video-receiver] URL de control del emisor: ${SENDER_CONTROL_URL}" | tee -a "${RESULTS_DIR}/receiver-summary.log"
+
+        echo "[video-receiver] Esperando a que wg0 esté listo..."
+        until ip link show wg0 > /dev/null 2>&1; do
+            sleep 1
+        done
+
+        echo "[video-receiver] Interfaz wg0 detectada" | tee -a "${RESULTS_DIR}/receiver-summary.log"
+        ip addr show wg0 > "${RESULTS_DIR}/receiver-ip-addr.log" 2>&1 || true
+
+        RECEIVER_URL="udp://0.0.0.0:${LISTEN_PORT}?fifo_size=${FIFO_SIZE}&buffer_size=${RECEIVER_BUFFER}&overrun_nonfatal=1"
+
+        echo "[video-receiver] URL de recepción: ${RECEIVER_URL}" | tee -a "${RESULTS_DIR}/receiver-summary.log"
+        echo "[video-receiver] Playlist HLS: ${HLS_DIR}/stream.m3u8" | tee -a "${RESULTS_DIR}/receiver-summary.log"
+
+        echo "sample,elapsed_s,rx_bytes,tx_bytes,rx_packets,tx_packets" > "${RESULTS_DIR}/receiver-wg0-samples.csv"
+
+        touch /tmp/ffmpeg-running
+
+        (
+            SAMPLE=0
+            START_TS=$(date +%s)
+
+            while [ -f /tmp/ffmpeg-running ]; do
+                NOW_TS=$(date +%s)
+                ELAPSED=$((NOW_TS - START_TS))
+
+                RX_BYTES=$(cat /sys/class/net/wg0/statistics/rx_bytes 2>/dev/null || echo 0)
+                TX_BYTES=$(cat /sys/class/net/wg0/statistics/tx_bytes 2>/dev/null || echo 0)
+                RX_PACKETS=$(cat /sys/class/net/wg0/statistics/rx_packets 2>/dev/null || echo 0)
+                TX_PACKETS=$(cat /sys/class/net/wg0/statistics/tx_packets 2>/dev/null || echo 0)
+
+                echo "${SAMPLE},${ELAPSED},${RX_BYTES},${TX_BYTES},${RX_PACKETS},${TX_PACKETS}" >> "${RESULTS_DIR}/receiver-wg0-samples.csv"
+
+                SAMPLE=$((SAMPLE + 1))
+                sleep "${SAMPLE_INTERVAL}"
+            done
+        ) &
+
+        MONITOR_PID=$!
+
+        echo "[video-receiver] Escuchando flujo de vídeo en puerto ${LISTEN_PORT}..." | tee -a "${RESULTS_DIR}/receiver-summary.log"
+
+        RECEIVED_TS="${HLS_DIR}/received.ts"
+
+        echo "[video-receiver] Fase 1: recibiendo flujo UDP y guardando MPEG-TS..." | tee -a "${RESULTS_DIR}/receiver-summary.log"
+        echo "[video-receiver] Tiempo máximo de espera: ${MAX_WAIT_SECONDS}s" | tee -a "${RESULTS_DIR}/receiver-summary.log"
+        echo "[video-receiver] Duración de captura: ${DURATION}s" | tee -a "${RESULTS_DIR}/receiver-summary.log"
+
+        timeout -k 10s -s INT "${MAX_WAIT_SECONDS}s" \
+            ffmpeg -y -hide_banner -nostdin -nostats -loglevel info \
+                -analyzeduration 10000000 \
+                -probesize 10000000 \
+                -i "${RECEIVER_URL}" \
+                -t "${DURATION}" \
+                -map 0 \
+                -c copy \
+                -f mpegts \
+                -stats_period "${SAMPLE_INTERVAL}" \
+                -progress "${RESULTS_DIR}/receiver-progress.raw" \
+                "${RECEIVED_TS}" \
+                > "${RESULTS_DIR}/receiver-ffmpeg-stdout.log" \
+                2> "${RESULTS_DIR}/receiver-capture-errors.log" &
+
+        RECEIVER_PID=$!
+
+        echo "[video-receiver] FFmpeg de recepción arrancado con PID ${RECEIVER_PID}" | tee -a "${RESULTS_DIR}/receiver-summary.log"
+        echo "[video-receiver] Receptor preparado. Esperando solicitud manual de inicio." | tee -a "${RESULTS_DIR}/receiver-summary.log"
+        echo "[video-receiver] Para iniciar la transmisión, ejecutar desde este pod:" | tee -a "${RESULTS_DIR}/receiver-summary.log"
+        echo "[video-receiver] curl ${SENDER_CONTROL_URL}" | tee -a "${RESULTS_DIR}/receiver-summary.log"
+
+        CAPTURE_MARGIN_SECONDS=22
+
+        (
+            echo "[video-receiver] Monitor de captura iniciado. Esperando datos en ${RECEIVED_TS}..." >> "${RESULTS_DIR}/receiver-summary.log"
+
+            WAITED=0
+
+            while [ ! -s "${RECEIVED_TS}" ]; do
+                if ! kill -0 "${RECEIVER_PID}" 2>/dev/null; then
+                    echo "[video-receiver] El proceso FFmpeg terminó antes de recibir datos." >> "${RESULTS_DIR}/receiver-summary.log"
+                    exit 0
+                fi
+
+                if [ "${WAITED}" -ge "${MAX_WAIT_SECONDS}" ]; then
+                    echo "[video-receiver] Tiempo máximo de espera alcanzado sin recibir vídeo." >> "${RESULTS_DIR}/receiver-summary.log"
+                    exit 0
+                fi
+
+                WAITED=$((WAITED + 1))
+                sleep 1
+            done
+
+            echo "[video-receiver] Detectados datos recibidos en ${RECEIVED_TS}." >> "${RESULTS_DIR}/receiver-summary.log"
+            echo "[video-receiver] Esperando $((DURATION + CAPTURE_MARGIN_SECONDS))s antes de cerrar la captura..." >> "${RESULTS_DIR}/receiver-summary.log"
+
+            sleep $((DURATION + CAPTURE_MARGIN_SECONDS))
+
+            echo "[video-receiver] Finalizando captura UDP de forma controlada..." >> "${RESULTS_DIR}/receiver-summary.log"
+            kill -INT "${RECEIVER_PID}" 2>/dev/null || true
+        ) &
+
+        CAPTURE_MONITOR_PID=$!
+
+
+        echo "[video-receiver] Esperando a que finalice la recepción..." | tee -a "${RESULTS_DIR}/receiver-summary.log"
+        wait "${RECEIVER_PID}" || true
+
+        if [ -f "${RESULTS_DIR}/receiver-progress.raw" ]; then
+            awk -F= '
+                BEGIN {
+                    print "sample,frame,fps,bitrate,total_size,out_time,speed,progress";
+                    sample=0;
+                }
+                {
+                    data[$1]=$2;
+                }
+                $1=="progress" {
+                    print sample "," data["frame"] "," data["fps"] "," data["bitrate"] "," data["total_size"] "," data["out_time"] "," data["speed"] "," data["progress"];
+                    fflush();
+                    sample++;
+                    delete data;
+                }
+            ' "${RESULTS_DIR}/receiver-progress.raw" > "${RESULTS_DIR}/receiver-progress.csv"
+        else
+            echo "sample,frame,fps,bitrate,total_size,out_time,speed,progress" > "${RESULTS_DIR}/receiver-progress.csv"
+        fi
+
+        if [ ! -s "${RECEIVED_TS}" ]; then
+            echo "[video-receiver] ERROR: no se ha generado ${RECEIVED_TS}" | tee -a "${RESULTS_DIR}/receiver-summary.log"
+            echo "[video-receiver] Errores de captura:" | tee -a "${RESULTS_DIR}/receiver-summary.log"
+            cat "${RESULTS_DIR}/receiver-capture-errors.log" | tee -a "${RESULTS_DIR}/receiver-summary.log" || true
+            rm -f /tmp/ffmpeg-running
+            wait "${MONITOR_PID}" 2>/dev/null || true
+            sleep infinity
+        fi
+
+        echo "[video-receiver] Fichero recibido:" | tee -a "${RESULTS_DIR}/receiver-summary.log"
+        ls -lh "${RECEIVED_TS}" | tee -a "${RESULTS_DIR}/receiver-summary.log"
+
+        echo "[video-receiver] Información del TS recibido:" > "${RESULTS_DIR}/receiver-ts-info.log"
+        ffprobe -hide_banner "${RECEIVED_TS}" >> "${RESULTS_DIR}/receiver-ts-info.log" 2>&1 || true
+
+        echo "[video-receiver] Fase 2: generando HLS VOD..." | tee -a "${RESULTS_DIR}/receiver-summary.log"
+
+        ffmpeg -y -hide_banner -nostdin -nostats -loglevel warning \
+            -i "${RECEIVED_TS}" \
+            -map 0 \
+            -c copy \
+            -f hls \
+            -hls_time "${HLS_SEGMENT_TIME}" \
+            -hls_list_size 0 \
+            -hls_playlist_type vod \
+            -hls_flags independent_segments \
+            -hls_segment_filename "${HLS_DIR}/segment_%03d.ts" \
+            "${HLS_DIR}/stream.m3u8" \
+            2> "${RESULTS_DIR}/receiver-hls-errors.log"
+
+        echo "[video-receiver] Contenido HLS generado:" >> "${RESULTS_DIR}/receiver-summary.log"
+        ls -lh "${HLS_DIR}" >> "${RESULTS_DIR}/receiver-summary.log" 2>&1 || true
+
+        LAST_LINE=$(tail -n 1 "${RESULTS_DIR}/receiver-progress.csv" || true)
+        echo "last_progress_line=${LAST_LINE}" >> "${RESULTS_DIR}/receiver-summary.log"
+        echo "completed_at=$(date -Iseconds)" >> "${RESULTS_DIR}/receiver-summary.log"
+
+        rm -f /tmp/ffmpeg-running
+        wait "${MONITOR_PID}" 2>/dev/null || true
+
+        echo "[video-receiver] Recepción finalizada" >> "${RESULTS_DIR}/receiver-summary.log"
+
+        sleep infinity
+{{- end -}}

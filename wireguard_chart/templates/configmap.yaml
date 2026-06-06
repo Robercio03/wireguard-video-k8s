@@ -1,0 +1,135 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wireguard-peers
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "wireguard.labels" . | nindent 4 }}
+data:
+  wg_port: "{{ .Values.wireguard.port }}"
+  network_cidr: "{{ .Values.wireguard.networkCIDR }}"
+
+  node_wg_ips: |
+    {{- range .Values.nodes }}
+    {{ .name }}:{{ .wgIP }}
+    {{- end }}
+
+  public_keys: |
+    {{- range .Values.nodes }}
+    {{ .name }}:{{ index $.Values.publicKeys .name }}
+    {{- end }}
+
+  node_hostnames: |
+    {{- range .Values.nodes }}
+    {{ .name }}:{{ .hostname }}
+    {{- end }}
+
+  init.sh: |
+    #!/bin/sh
+    set -eu
+
+    NAMESPACE="{{ .Values.namespace }}"
+    WG_INTERFACE="{{ .Values.wireguard.interface }}"
+    WG_PORT="{{ .Values.wireguard.port }}"
+    CONFIG_OUT="/config/wg0.conf"
+    APISERVER="https://kubernetes.default.svc"
+    SA_TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+    CA_CERT="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+
+    MY_NODE_NAME="${MY_NODE_NAME}"   # inyectado via fieldRef en el Deployment
+    MY_WG_IP="${MY_WG_IP}"           # inyectado via env en el Deployment
+
+    echo "[init] Nodo actual: ${MY_NODE_NAME}"
+    echo "[init] IP WireGuard asignada: ${MY_WG_IP}"
+
+    PRIVATE_KEY=$(cat /secrets/privateKey)
+    NETWORK_PREFIX=$(echo "{{ .Values.wireguard.networkCIDR }}" | cut -d'/' -f2)
+
+    cat > "${CONFIG_OUT}" <<EOF
+    [Interface]
+    Address = ${MY_WG_IP}/${NETWORK_PREFIX}
+    ListenPort = ${WG_PORT}
+    PrivateKey = ${PRIVATE_KEY}
+    # Permite reenvío de paquetes (necesario para gateway de video)
+    PostUp   = iptables -A FORWARD -i ${WG_INTERFACE} -j ACCEPT; iptables -A FORWARD -o ${WG_INTERFACE} -j ACCEPT
+    PostDown = iptables -D FORWARD -i ${WG_INTERFACE} -j ACCEPT; iptables -D FORWARD -o ${WG_INTERFACE} -j ACCEPT
+    EOF
+
+
+    while IFS= read -r line; do
+      line=$(echo "$line" | tr -d ' ')
+      [ -z "$line" ] && continue
+
+      PEER_NAME=$(echo "$line" | cut -d':' -f1)
+      PEER_WG_IP=$(echo "$line" | cut -d':' -f2)
+
+      # Saltar si somos nosotros mismos
+      if [ "${PEER_NAME}" = "${MY_NODE_NAME}" ]; then
+        continue
+      fi
+
+      echo "[init] Buscando IP del pod WireGuard en nodo: ${PEER_NAME}"
+
+      PEER_POD_IP=""
+      ATTEMPT=1
+      MAX_ATTEMPTS=30
+
+      while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+        HTTP_CODE=$(curl -sS -o /tmp/peer.json -w "%{http_code}" \
+          --cacert "${CA_CERT}" \
+          -H "Authorization: Bearer ${SA_TOKEN}" \
+          "${APISERVER}/api/v1/namespaces/${NAMESPACE}/pods?labelSelector=wireguard.node%3D${PEER_NAME}" \
+          2>/tmp/peer.err || true)
+
+        echo "[init] Peer ${PEER_NAME} intento ${ATTEMPT}/${MAX_ATTEMPTS} HTTP=${HTTP_CODE}"
+
+        if [ "${HTTP_CODE}" = "200" ]; then
+          echo "[init] Respuesta API:"
+          cat /tmp/peer.json
+          echo
+
+          PEER_POD_IP=$(cat /tmp/peer.json | jq -r '.items[0].status.podIP // empty')
+
+          if [ -n "${PEER_POD_IP}" ]; then
+            break
+          fi
+        else
+          echo "[init] stderr curl:"
+          cat /tmp/peer.err || true
+          echo "[init] body:"
+          cat /tmp/peer.json || true
+        fi
+
+        sleep 2
+        ATTEMPT=$((ATTEMPT + 1))
+      done
+
+      if [ -z "${PEER_POD_IP}" ]; then
+        echo "[init] ERROR: peer ${PEER_NAME} no aparece con podIP tras varios intentos"
+        exit 1
+      fi
+
+      echo "[init] ✅ Peer ${PEER_NAME}: pod IP = ${PEER_POD_IP}, WG IP = ${PEER_WG_IP}"
+
+      PEER_PUBKEY=$(grep "^${PEER_NAME}:" /peers/public_keys | cut -d':' -f2)
+
+      if [ -z "${PEER_PUBKEY}" ]; then
+        echo "[init] ⚠️  Clave pública para ${PEER_NAME} no encontrada en ConfigMap, saltando..."
+        continue
+      fi
+
+      cat >> "${CONFIG_OUT}" <<EOF
+
+    [Peer]
+    # ${PEER_NAME}
+    PublicKey = ${PEER_PUBKEY}
+    AllowedIPs = ${PEER_WG_IP}/32
+    Endpoint = ${PEER_POD_IP}:${WG_PORT}
+    PersistentKeepalive = 25
+    EOF
+
+    done < /peers/node_wg_ips
+
+    echo "[init] ✅ wg0.conf generado:"
+    grep -v PrivateKey "${CONFIG_OUT}"
+    echo "[init] Configuración lista, arrancando WireGuard..."
