@@ -79,7 +79,7 @@ echo ""
 
 echo "=============================================="
 echo ""
-echo "✅ Copia este bloque en tu values.yaml:"
+echo "✅ Pasar claves públicas al values.yaml:"
 echo ""
 echo "publicKeys:"
 for NODE in "${NODES[@]}"; do
@@ -87,9 +87,6 @@ for NODE in "${NODES[@]}"; do
 done
 echo ""
 echo "=============================================="
-echo ""
-echo "⚠️  Las claves privadas están en: $OUTPUT_DIR/"
-echo "   NO las subas a Git. Añade 'wg-keys/' a tu .gitignore"
 echo ""
 echo "Próximo paso:"
 echo "  1. Pega el bloque publicKeys en values.yaml"
